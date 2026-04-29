@@ -243,8 +243,12 @@ func (p *Win32Menu) ShowAt(x int, y int) {
 
 func (p *Win32Menu) ShowAtCursor() {
 	x, y, ok := w32.GetCursorPos()
-	if ok == false {
-		globalApplication.fatal("GetCursorPos failed")
+	if !ok {
+		// GetCursorPos can fail when the calling thread does not have access
+		// to the input desktop (workstation locked, RDP/UAC desktop switch,
+		// session torn down). Skip the popup rather than killing the process —
+		// the windowsMenu.ShowAtCursor sibling already handles this gracefully.
+		return
 	}
 
 	p.ShowAt(x, y)
