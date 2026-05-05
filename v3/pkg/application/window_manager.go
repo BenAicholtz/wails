@@ -82,10 +82,12 @@ func (wm *WindowManager) Current() Window {
 // Add adds a window to the manager
 func (wm *WindowManager) Add(window Window) {
 	wm.app.windowsLock.Lock()
-	defer wm.app.windowsLock.Unlock()
 	wm.app.windows[window.ID()] = window
+	wm.app.windowsLock.Unlock()
 
-	// Call registered callbacks
+	// Call registered callbacks outside the lock so a callback that takes
+	// windowsLock (or blocks on the main thread, which itself takes
+	// windowsLock) cannot deadlock against concurrent readers/writers.
 	for _, callback := range wm.app.windowCreatedCallbacks {
 		callback(window)
 	}
