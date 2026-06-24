@@ -1363,6 +1363,21 @@ func (w *linuxWebviewWindow) minimise() {
 func windowNew(application pointer, menu pointer, _ LinuxMenuStyle, windowId uint, gpuPolicy WebviewGpuPolicy) (window, webview, vbox pointer) {
 	window = pointer(C.gtk_application_window_new((*C.GtkApplication)(application)))
 	C.g_object_ref_sink(C.gpointer(window))
+
+	// Install a zero-height GtkEventBox as the window's titlebar so GTK
+	// opts into client-side decorations via xdg-decoration on Wayland.
+	// Without an explicit CSD signal, KWin 6.7+ defaults to server-side
+	// decoration for the toplevel, producing a double-titlebar / broken-
+	// resize symptom on KDE Plasma. The titlebar widget has height 0 so
+	// no chrome is visible; the embedded WebView fills the entire window
+	// and the application is expected to provide its own chrome in HTML.
+	// gtk_window_set_titlebar() must be called before realize, so this
+	// runs here in windowNew rather than from a post-creation hook.
+	emptyTitlebar := C.gtk_event_box_new()
+	C.gtk_widget_set_size_request(emptyTitlebar, -1, 0)
+	C.gtk_widget_show(emptyTitlebar)
+	C.gtk_window_set_titlebar((*C.GtkWindow)(window), emptyTitlebar)
+
 	webview = windowNewWebview(windowId, gpuPolicy)
 	vbox = pointer(C.gtk_box_new(C.GTK_ORIENTATION_VERTICAL, 0))
 	name := C.CString("webview-box")
@@ -1526,6 +1541,15 @@ func windowSetGeometryHints(window pointer, minWidth, minHeight, maxWidth, maxHe
 }
 
 func (w *linuxWebviewWindow) setFrameless(frameless bool) {
+	// If a custom titlebar widget is installed (see windowNew, which sets a
+	// zero-height GtkEventBox to opt into Wayland CSD), don't toggle
+	// gtk_window_set_decorated. Setting decorated=FALSE hides the title_box
+	// widget, which cancels the CSD opt-in -- KWin 6.7+ then falls back to
+	// server-side decoration. The custom titlebar already gives us a
+	// chrome-less window; nothing more is needed.
+	if C.gtk_window_get_titlebar(w.gtkWindow()) != nil {
+		return
+	}
 	C.gtk_window_set_decorated(w.gtkWindow(), gtkBool(!frameless))
 	// TODO: Deal with transparency for the titlebar if possible when !frameless
 	//       Perhaps we just make it undecorated and add a menu bar inside?
