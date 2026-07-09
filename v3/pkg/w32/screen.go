@@ -4,6 +4,7 @@ package w32
 
 import (
 	"fmt"
+	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -72,69 +73,101 @@ func GetRotationForMonitor(displayName [32]uint16) (float32, error) {
 	return -1, nil
 }
 
+// enumScreens holds the per-enumeration state and the singleton callback used
+// by GetAllScreens.
+//
+// syscall.NewCallback registers a callback in a fixed-size, process-lifetime
+// table that Go never frees, and the process is capped at ~2000 callbacks
+// total. Creating a fresh callback on every GetAllScreens call (as the previous
+// code did) leaked one slot per call, so a long-running app that re-enumerates
+// monitors on every WM_DISPLAYCHANGE / WM_SETTINGCHANGE eventually exhausts the
+// table and dies with "fatal error: too many callback functions".
+//
+// The callback is now created exactly once. EnumDisplayMonitors runs the
+// callback synchronously on the calling thread before returning, so a single
+// mutex is enough to make the shared state safe across concurrent callers.
+var enumScreens struct {
+	mu       sync.Mutex
+	once     sync.Once
+	callback uintptr
+	result   []*Screen
+	errMsg   string
+	cursor   POINT
+}
+
+func enumMonitorProc(hMonitor uintptr, hdc uintptr, lprcMonitor *RECT, lParam uintptr) uintptr {
+	monitor := MONITORINFOEX{
+		MONITORINFO: MONITORINFO{
+			CbSize: uint32(unsafe.Sizeof(MONITORINFOEX{})),
+		},
+		SzDevice: [32]uint16{},
+	}
+	ret, _, _ := procGetMonitorInfo.Call(hMonitor, uintptr(unsafe.Pointer(&monitor)))
+	if ret == 0 {
+		enumScreens.errMsg = "GetMonitorInfo failed"
+		return 0 // Stop enumeration
+	}
+
+	screen := &Screen{
+		MONITORINFOEX: monitor,
+		HMonitor:      hMonitor,
+		IsPrimary:     monitor.DwFlags == MONITORINFOF_PRIMARY,
+		IsCurrent:     rectContainsPoint(monitor.RcMonitor, enumScreens.cursor),
+	}
+
+	// Get monitor name
+	name, err := getMonitorName(syscall.UTF16ToString(monitor.SzDevice[:]))
+	if err == nil {
+		screen.Name = name
+	}
+
+	// Get DPI for monitor
+	var dpiX, dpiY uint
+	ret = GetDPIForMonitor(hMonitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)
+	if ret != S_OK {
+		enumScreens.errMsg = "GetDpiForMonitor failed"
+		return 0 // Stop enumeration
+	}
+	// Convert to scale factor
+	screen.ScaleFactor = float32(dpiX) / 96.0
+
+	// Get rotation of monitor
+	rot, err := GetRotationForMonitor(monitor.SzDevice)
+	if err == nil {
+		screen.Rotation = rot
+	}
+
+	enumScreens.result = append(enumScreens.result, screen)
+	return 1 // Continue enumeration
+}
+
 func GetAllScreens() ([]*Screen, error) {
-	var result []*Screen
-	var errMessage string
+	enumScreens.once.Do(func() {
+		enumScreens.callback = syscall.NewCallback(enumMonitorProc)
+	})
+
+	enumScreens.mu.Lock()
+	defer enumScreens.mu.Unlock()
+
+	// Reset per-enumeration state.
+	enumScreens.result = nil
+	enumScreens.errMsg = ""
 
 	// Get cursor position to determine the current monitor
-	var cursor POINT
-	ret, _, _ := procGetCursorPos.Call(uintptr(unsafe.Pointer(&cursor)))
+	ret, _, _ := procGetCursorPos.Call(uintptr(unsafe.Pointer(&enumScreens.cursor)))
 	if ret == 0 {
 		return nil, fmt.Errorf("GetCursorPos failed")
 	}
 
-	// Enumerate the monitors
-	enumFunc := func(hMonitor uintptr, hdc uintptr, lprcMonitor *RECT, lParam uintptr) uintptr {
-		monitor := MONITORINFOEX{
-			MONITORINFO: MONITORINFO{
-				CbSize: uint32(unsafe.Sizeof(MONITORINFOEX{})),
-			},
-			SzDevice: [32]uint16{},
-		}
-		ret, _, _ := procGetMonitorInfo.Call(hMonitor, uintptr(unsafe.Pointer(&monitor)))
-		if ret == 0 {
-			errMessage = "GetMonitorInfo failed"
-			return 0 // Stop enumeration
-		}
-
-		screen := &Screen{
-			MONITORINFOEX: monitor,
-			HMonitor:      hMonitor,
-			IsPrimary:     monitor.DwFlags == MONITORINFOF_PRIMARY,
-			IsCurrent:     rectContainsPoint(monitor.RcMonitor, cursor),
-		}
-
-		// Get monitor name
-		name, err := getMonitorName(syscall.UTF16ToString(monitor.SzDevice[:]))
-		if err == nil {
-			screen.Name = name
-		}
-
-		// Get DPI for monitor
-		var dpiX, dpiY uint
-		ret = GetDPIForMonitor(hMonitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)
-		if ret != S_OK {
-			errMessage = "GetDpiForMonitor failed"
-			return 0 // Stop enumeration
-		}
-		// Convert to scale factor
-		screen.ScaleFactor = float32(dpiX) / 96.0
-
-		// Get rotation of monitor
-		rot, err := GetRotationForMonitor(monitor.SzDevice)
-		if err == nil {
-			screen.Rotation = rot
-		}
-
-		result = append(result, screen)
-		return 1 // Continue enumeration
-	}
-
-	ret, _, _ = procEnumDisplayMonitors.Call(0, 0, syscall.NewCallback(enumFunc), 0)
+	ret, _, _ = procEnumDisplayMonitors.Call(0, 0, enumScreens.callback, 0)
 	if ret == 0 {
-		return nil, fmt.Errorf("EnumDisplayMonitors failed: %s", errMessage)
+		return nil, fmt.Errorf("EnumDisplayMonitors failed: %s", enumScreens.errMsg)
 	}
 
+	// Copy out under the lock so the returned slice is not aliased by the next
+	// enumeration's reset.
+	result := enumScreens.result
+	enumScreens.result = nil
 	return result, nil
 }
 
