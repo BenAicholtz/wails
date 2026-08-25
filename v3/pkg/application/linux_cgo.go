@@ -1537,7 +1537,19 @@ func windowSetGeometryHints(window pointer, minWidth, minHeight, maxWidth, maxHe
 		max_width:  C.int(maxWidth),
 		max_height: C.int(maxHeight),
 	}
-	C.gtk_window_set_geometry_hints((*C.GtkWindow)(window), nil, &size, C.GDK_HINT_MAX_SIZE|C.GDK_HINT_MIN_SIZE)
+	// Only advertise PMaxSize when a max is actually set; a spurious max-size
+	// hint blocks maximization on WMs that require max >= screen size (xfwm4).
+	flags := C.GdkWindowHints(C.GDK_HINT_MIN_SIZE)
+	if maxWidth > 0 || maxHeight > 0 {
+		if maxWidth <= 0 {
+			size.max_width = C.G_MAXINT
+		}
+		if maxHeight <= 0 {
+			size.max_height = C.G_MAXINT
+		}
+		flags |= C.GDK_HINT_MAX_SIZE
+	}
+	C.gtk_window_set_geometry_hints((*C.GtkWindow)(window), nil, &size, flags)
 }
 
 func (w *linuxWebviewWindow) setFrameless(frameless bool) {

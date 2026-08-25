@@ -106,8 +106,7 @@ func (w *linuxWebviewWindow) setMaximiseButtonEnabled(enabled bool) {
 }
 
 func (w *linuxWebviewWindow) disableSizeConstraints() {
-	x, y, width, height, scaleFactor := w.getCurrentMonitorGeometry()
-	w.setMinMaxSize(x, y, int(float64(width)*scaleFactor), int(float64(height)*scaleFactor))
+	w.setMinMaxSize(0, 0, 0, 0)
 }
 
 func (w *linuxWebviewWindow) unminimise() {
@@ -167,20 +166,10 @@ func newWindowImpl(parent *WebviewWindow) *linuxWebviewWindow {
 }
 
 func (w *linuxWebviewWindow) setMinMaxSize(minWidth, minHeight, maxWidth, maxHeight int) {
-	// Get current screen for window
-	_, _, monitorwidth, monitorheight, _ := w.getCurrentMonitorGeometry()
-	if monitorwidth == -1 {
-		monitorwidth = 1920
-	}
-	if monitorheight == -1 {
-		monitorheight = 1080
-	}
-	if maxWidth == 0 {
-		maxWidth = monitorwidth
-	}
-	if maxHeight == 0 {
-		maxHeight = monitorheight
-	}
+	// A max size of 0 means "no limit". Don't substitute the monitor size:
+	// a PMaxSize hint smaller than the X screen makes xfwm4 (and other strict
+	// WMs) refuse _NET_WM_STATE_MAXIMIZED requests entirely, and it caps the
+	// window at the size of whatever monitor it happened to start on.
 	windowSetGeometryHints(w.window, minWidth, minHeight, maxWidth, maxHeight)
 }
 
