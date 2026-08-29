@@ -235,6 +235,19 @@ func (i *ICoreWebView2) AddNavigationCompleted(eventHandler *ICoreWebView2Naviga
 	return nil
 }
 
+func (i *ICoreWebView2) AddNewWindowRequested(handler *iCoreWebView2NewWindowRequestedEventHandler, token *_EventRegistrationToken) error {
+	hr, _, _ := i.vtbl.AddNewWindowRequested.Call(
+		uintptr(unsafe.Pointer(i)),
+		uintptr(unsafe.Pointer(handler)),
+		uintptr(unsafe.Pointer(token)),
+	)
+	if windows.Handle(hr) != windows.S_OK {
+		return windows.Errno(hr)
+	}
+
+	return nil
+}
+
 func (i *ICoreWebView2) AddPermissionRequested(handler *iCoreWebView2PermissionRequestedEventHandler, token *_EventRegistrationToken) error {
 	hr, _, _ := i.vtbl.AddPermissionRequested.Call(
 		uintptr(unsafe.Pointer(i)),

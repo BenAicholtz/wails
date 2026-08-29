@@ -72,6 +72,11 @@ type Chromium struct {
 	navigationStarting               *ICoreWebView2NavigationStartingEventHandler
 	navigationCompleted              *ICoreWebView2NavigationCompletedEventHandler
 	processFailed                    *ICoreWebView2ProcessFailedEventHandler
+	newWindowRequested               *iCoreWebView2NewWindowRequestedEventHandler
+
+	// controllerRetryCount tracks failed CreateCoreWebView2Controller attempts
+	// so a transient failure is retried before being treated as fatal.
+	controllerRetryCount int
 
 	environment            *ICoreWebView2Environment
 	webview2RuntimeVersion string
@@ -134,6 +139,7 @@ func NewChromium() *Chromium {
 	e.navigationStarting = newICoreWebView2NavigationStartingEventHandler(e)
 	e.navigationCompleted = newICoreWebView2NavigationCompletedEventHandler(e)
 	e.processFailed = newICoreWebView2ProcessFailedEventHandler(e)
+	e.newWindowRequested = newICoreWebView2NewWindowRequestedEventHandler(e)
 	e.containsFullScreenElementChanged = newICoreWebView2ContainsFullScreenElementChangedEventHandler(e)
 	/*
 		// Pinner seems to panic in some cases as reported on Discord, maybe during shutdown when GC detects pinned objects
@@ -160,9 +166,24 @@ func (e *Chromium) ShuttingDown() {
 	e.shuttingDown = true
 }
 
+// errorExitOnReturn controls whether errorCallback calls os.Exit(1) after the
+// installed handler returns. Default true preserves the historic behaviour.
+// Embedders whose handler can recover from transient runtime WebView2 errors
+// (e.g. a GPU TDR yielding 0x8007139F) can disable it via SetErrorExitOnReturn
+// and manage process termination themselves for genuinely-fatal cases.
+var errorExitOnReturn = true
+
+// SetErrorExitOnReturn toggles the os.Exit(1) that errorCallback performs once
+// the error handler returns.
+func SetErrorExitOnReturn(exit bool) {
+	errorExitOnReturn = exit
+}
+
 func (e *Chromium) errorCallback(err error) {
 	e.globalErrorCallback(err)
-	os.Exit(1)
+	if errorExitOnReturn {
+		os.Exit(1)
+	}
 }
 
 func (e *Chromium) SetErrorCallback(callback func(error)) {
@@ -350,20 +371,74 @@ func (e *Chromium) Init(script string) {
 	}
 }
 
+// hresultInvalidState is HRESULT 0x8007139F (ERROR_INVALID_STATE wrapped as
+// HRESULT_FROM_WIN32). WebView2 returns this from ExecuteScript /
+// PostWebMessage* when the underlying environment is momentarily not ready —
+// most commonly during the first ~1-3 seconds after process startup when an
+// older WebView2 host (e.g. from a just-killed prior instance of the app
+// before an auto-update restart) hasn't finished releasing the per-user-data-
+// folder lock, and after a GPU TDR resets the D3D11 device. Microsoft's
+// documented workaround is to retry the call after a short delay until the
+// environment stabilises.
+const hresultInvalidState = 0x8007139F
+
+// evalRetryMax bounds the per-call retry budget so a persistent failure still
+// surfaces instead of spinning forever.
+//
+// Sized to absorb both common transient causes of 0x8007139F:
+//   - Post-startup race (old WebView2 host releasing the user-data-folder
+//     lock): recovers in well under 1s, the first few retries cover it.
+//   - GPU TDR (Windows Timeout Detection & Recovery resetting the D3D11
+//     device under heavy video load): WebView2's ANGLE pipeline needs 2-5s to
+//     rebuild. 30 × 100ms = 3s catches the vast majority.
+const evalRetryMax = 30
+
+// evalRetryDelay is the wait between retries. 100ms × 30 = 3s worst case.
+const evalRetryDelay = 100 * time.Millisecond
+
+// isTransientWebView2State reports whether err is a WebView2 HRESULT that
+// Microsoft documents as worth retrying (the environment is in a temporarily
+// invalid state and will recover on its own).
+func isTransientWebView2State(err error) bool {
+	if err == nil {
+		return false
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return uint32(errno) == hresultInvalidState
+	}
+	// Some call paths surface the HRESULT as a string-wrapped error before it
+	// reaches us. Match on the hex code as a fallback.
+	return strings.Contains(err.Error(), "8007139f") || strings.Contains(err.Error(), "8007139F")
+}
+
 func (e *Chromium) Eval(script string) {
 	if e.webview == nil || e.shuttingDown {
 		return
 	}
 
-	err := e.webview.ExecuteScript(script, nil)
-	if err != nil && !errors.Is(err, windows.ERROR_IO_PENDING) {
-		// ExecuteScript fails transiently while the browser process is busy
-		// reconfiguring — e.g. RESOURCE_NOT_IN_CORRECT_STATE during a DPI
+	for attempt := 0; ; attempt++ {
+		err := e.webview.ExecuteScript(script, nil)
+		if err == nil || errors.Is(err, windows.ERROR_IO_PENDING) {
+			return
+		}
+		if isTransientWebView2State(err) && attempt < evalRetryMax {
+			// Shutdown can begin while we're sleeping; bail out so we don't
+			// resurrect a half-torn-down webview.
+			if e.shuttingDown {
+				return
+			}
+			time.Sleep(evalRetryDelay)
+			continue
+		}
+		// ExecuteScript also fails transiently while the browser process is
+		// busy reconfiguring — e.g. RESOURCE_NOT_IN_CORRECT_STATE during a DPI
 		// transition when the window is dragged between mixed-DPI monitors
 		// (wailsapp/wails#5544). Script execution is fire-and-forget; a
 		// dropped script during a transition is recoverable, killing the
 		// process (errorCallback) is not.
 		log.Printf("[WebView2] Eval failed: %v", err)
+		return
 	}
 }
 
@@ -417,9 +492,26 @@ func (e *Chromium) EnvironmentCompleted(res uintptr, env *ICoreWebView2Environme
 	return 0
 }
 
+// maxControllerRetries bounds how many times controller creation is retried
+// before the failure is treated as fatal. Creation fails transiently when the
+// WebView2 runtime is still starting up or recovering (0x8007139F and friends),
+// and a retry against the already-created environment usually succeeds.
+const maxControllerRetries = 3
+
 func (e *Chromium) CreateCoreWebView2ControllerCompleted(res uintptr, controller *ICoreWebView2Controller) uintptr {
 	if int32(res) < 0 {
-		e.errorCallback(fmt.Errorf("error creating controller with %08x: %s", res, syscall.Errno(res)))
+		e.controllerRetryCount++
+		log.Printf("[WebView2] Controller creation failed with %08x: %s (attempt %d/%d)",
+			res, syscall.Errno(res), e.controllerRetryCount, maxControllerRetries)
+		if e.controllerRetryCount < maxControllerRetries && e.environment != nil {
+			if err := e.environment.CreateCoreWebView2Controller(e.hwnd, e.controllerCompleted); err != nil {
+				e.errorCallback(fmt.Errorf("error retrying controller creation: %s", err.Error()))
+			}
+			return 0
+		}
+		e.errorCallback(fmt.Errorf("error creating controller with %08x: %s (after %d attempts)",
+			res, syscall.Errno(res), e.controllerRetryCount))
+		return 0
 	}
 
 	return e.initializeController(controller)
@@ -577,6 +669,10 @@ func (e *Chromium) initializeController(controller *ICoreWebView2Controller) uin
 	if err != nil {
 		e.errorCallback(err)
 	}
+	err = e.webview.AddNewWindowRequested(e.newWindowRequested, &token)
+	if err != nil {
+		e.errorCallback(err)
+	}
 	err = e.webview.AddNavigationCompleted(e.navigationCompleted, &token)
 	if err != nil {
 		e.errorCallback(err)
@@ -662,9 +758,23 @@ func (e *Chromium) MessageReceived(sender *ICoreWebView2, args *ICoreWebView2Web
 		e.MessageCallback(message, sender, args)
 	}
 
-	err = sender.PostWebMessageAsString(message)
-	if err != nil && !errors.Is(err, windows.ERROR_IO_PENDING) {
+	// Same transient-state retry as Eval: PostWebMessageAsString is the other
+	// hot path that surfaces 0x8007139F during WebView2's recovery window
+	// after a GPU TDR or after the previous host process exits.
+	for attempt := 0; ; attempt++ {
+		err = sender.PostWebMessageAsString(message)
+		if err == nil || errors.Is(err, windows.ERROR_IO_PENDING) {
+			break
+		}
+		if isTransientWebView2State(err) && attempt < evalRetryMax {
+			if e.shuttingDown {
+				break
+			}
+			time.Sleep(evalRetryDelay)
+			continue
+		}
 		log.Printf("[WebView2] PostWebMessageAsString failed: %v", err)
+		break
 	}
 	return 0
 }
@@ -812,7 +922,83 @@ func (e *Chromium) NavigationCompleted(sender *ICoreWebView2, args *ICoreWebView
 	return 0
 }
 
+// OpenExternalURLHook, when non-nil, is consulted for every new-window request
+// WebView2 raises (window.open, target="_blank", or a link clicked inside a
+// cross-origin iframe such as a YouTube embed). Returning true means the URL
+// was handed off to the OS (e.g. the user's default browser) and WebView2 must
+// not create its own bare in-app popup window. The hook is package-level so it
+// applies to every window the app hosts without threading a callback through
+// the framework.
+var OpenExternalURLHook func(url string) bool
+
+// NewWindowRequested fires when content asks WebView2 to open a new top-level
+// window. Left unhandled, WebView2 satisfies the request by spawning its own
+// bare popup window (which reads to users as an in-app "browser"). With a hook
+// installed, genuine web links are routed to the OS default browser instead.
+func (e *Chromium) NewWindowRequested(sender *ICoreWebView2, args *ICoreWebView2NewWindowRequestedEventArgs) uintptr {
+	hook := OpenExternalURLHook
+	if hook == nil {
+		// No external handler wired: keep WebView2's default behaviour.
+		return 0
+	}
+
+	uri, err := args.GetUri()
+	if err != nil || uri == "" {
+		return 0
+	}
+
+	// Only redirect real web / mail links. Leave anything else (about:blank,
+	// data:, blob:, custom app schemes) to WebView2's default handling.
+	lower := strings.ToLower(uri)
+	if !strings.HasPrefix(lower, "http://") &&
+		!strings.HasPrefix(lower, "https://") &&
+		!strings.HasPrefix(lower, "mailto:") {
+		return 0
+	}
+
+	// setHandled stops WebView2 from spawning its own popup window. A failure
+	// here is non-fatal (worst case an extra popup opens), so just log it.
+	setHandled := func() {
+		if err := args.PutHandled(true); err != nil {
+			log.Printf("[WebView2] NewWindowRequested PutHandled failed for %q: %v", uri, err)
+		}
+	}
+
+	// Silently drop programmatic (ad / auto) popups the way a browser's popup
+	// blocker would, so a rogue iframe can't spam the user's default browser.
+	// If the user-initiated flag can't be read, fail open and treat it as a
+	// genuine gesture below.
+	if userInitiated, uErr := args.GetIsUserInitiated(); uErr == nil && !userInitiated {
+		setHandled()
+		return 0
+	}
+
+	// Genuine user gesture: hand off to the OS default browser. Only suppress
+	// WebView2's own popup once the hand-off succeeds, so a failed launch can
+	// still fall back to WebView2's default handling instead of the click
+	// silently doing nothing.
+	if hook(uri) {
+		setHandled()
+	}
+	return 0
+}
+
+// ProcessFailedRecoveryHook, when non-nil, is consulted before the host
+// framework's ProcessFailedCallback runs. Returning true marks the failure as
+// handled and suppresses that callback, letting the app relaunch or recover
+// instead of being terminated.
+var ProcessFailedRecoveryHook func(kind COREWEBVIEW2_PROCESS_FAILED_KIND) bool
+
 func (e *Chromium) ProcessFailed(sender *ICoreWebView2, args *ICoreWebView2ProcessFailedEventArgs) uintptr {
+	if ProcessFailedRecoveryHook != nil {
+		// A failure to read the kind is not itself a reason to bypass the host
+		// callback, so only consult the hook when the kind is known.
+		if kind, err := args.GetProcessFailedKind(); err == nil {
+			if ProcessFailedRecoveryHook(kind) {
+				return 0
+			}
+		}
+	}
 	if e.ProcessFailedCallback != nil {
 		e.ProcessFailedCallback(sender, args)
 	}
