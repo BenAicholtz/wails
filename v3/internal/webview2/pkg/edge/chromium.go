@@ -412,34 +412,60 @@ func isTransientWebView2State(err error) bool {
 	return strings.Contains(err.Error(), "8007139f") || strings.Contains(err.Error(), "8007139F")
 }
 
+// retryScheduler runs fn on the WebView2 thread after delay WITHOUT blocking
+// the caller. The host framework installs it (see SetRetryScheduler); until it
+// does, a transient failure is logged and dropped rather than retried.
+//
+// This indirection exists because ExecuteScript and PostWebMessageAsString must
+// run on the thread that owns the controller - the main/UI thread - so a retry
+// cannot simply sleep where it stands. Sleeping there blocks the message pump:
+// with a 3s budget, a few queued calls stall the UI long enough to trip a host
+// freeze watchdog, during a GPU TDR that would otherwise have recovered
+// unnoticed.
+var retryScheduler func(delay time.Duration, fn func())
+
+// SetRetryScheduler installs the callback used to re-run a transiently-failed
+// WebView2 call later, on the WebView2 thread. Pass nil to disable retries.
+func SetRetryScheduler(s func(delay time.Duration, fn func())) {
+	retryScheduler = s
+}
+
+// scheduleRetry asks the host to re-run fn after evalRetryDelay, reporting
+// whether a retry was actually scheduled.
+func (e *Chromium) scheduleRetry(attempt int, fn func()) bool {
+	if attempt >= evalRetryMax || retryScheduler == nil || e.shuttingDown {
+		return false
+	}
+	retryScheduler(evalRetryDelay, fn)
+	return true
+}
+
 func (e *Chromium) Eval(script string) {
+	e.evalAttempt(script, 0)
+}
+
+func (e *Chromium) evalAttempt(script string, attempt int) {
+	// Re-checked every attempt: teardown can begin between retries.
 	if e.webview == nil || e.shuttingDown {
 		return
 	}
 
-	for attempt := 0; ; attempt++ {
-		err := e.webview.ExecuteScript(script, nil)
-		if err == nil || errors.Is(err, windows.ERROR_IO_PENDING) {
-			return
-		}
-		if isTransientWebView2State(err) && attempt < evalRetryMax {
-			// Shutdown can begin while we're sleeping; bail out so we don't
-			// resurrect a half-torn-down webview.
-			if e.shuttingDown {
-				return
-			}
-			time.Sleep(evalRetryDelay)
-			continue
-		}
-		// ExecuteScript also fails transiently while the browser process is
-		// busy reconfiguring — e.g. RESOURCE_NOT_IN_CORRECT_STATE during a DPI
-		// transition when the window is dragged between mixed-DPI monitors
-		// (wailsapp/wails#5544). Script execution is fire-and-forget; a
-		// dropped script during a transition is recoverable, killing the
-		// process (errorCallback) is not.
-		log.Printf("[WebView2] Eval failed: %v", err)
+	err := e.webview.ExecuteScript(script, nil)
+	if err == nil || errors.Is(err, windows.ERROR_IO_PENDING) {
 		return
 	}
+	if isTransientWebView2State(err) && e.scheduleRetry(attempt, func() {
+		e.evalAttempt(script, attempt+1)
+	}) {
+		return
+	}
+	// ExecuteScript also fails transiently while the browser process is busy
+	// reconfiguring, e.g. RESOURCE_NOT_IN_CORRECT_STATE during a DPI transition
+	// when the window is dragged between mixed-DPI monitors
+	// (wailsapp/wails#5544). Script execution is fire-and-forget: a dropped
+	// script during a transition is recoverable, killing the process
+	// (errorCallback) is not.
+	log.Printf("[WebView2] Eval failed: %v", err)
 }
 
 func (e *Chromium) Show() error {
@@ -760,23 +786,32 @@ func (e *Chromium) MessageReceived(sender *ICoreWebView2, args *ICoreWebView2Web
 
 	// Same transient-state retry as Eval: PostWebMessageAsString is the other
 	// hot path that surfaces 0x8007139F during WebView2's recovery window
-	// after a GPU TDR or after the previous host process exits.
-	for attempt := 0; ; attempt++ {
-		err = sender.PostWebMessageAsString(message)
-		if err == nil || errors.Is(err, windows.ERROR_IO_PENDING) {
-			break
-		}
-		if isTransientWebView2State(err) && attempt < evalRetryMax {
-			if e.shuttingDown {
-				break
-			}
-			time.Sleep(evalRetryDelay)
-			continue
-		}
-		log.Printf("[WebView2] PostWebMessageAsString failed: %v", err)
-		break
-	}
+	// after a GPU TDR or after the previous host process exits. This runs in a
+	// COM event callback on the WebView2 thread, so the retry is scheduled
+	// rather than slept through.
+	e.postMessageAttempt(message, 0)
 	return 0
+}
+
+// postMessageAttempt echoes message back to the webview, retrying later if
+// WebView2 reports a transient state. It deliberately uses e.webview rather
+// than the event's sender, so a retry landing after teardown is caught by the
+// Chromium instance's own lifecycle flags.
+func (e *Chromium) postMessageAttempt(message string, attempt int) {
+	if e.webview == nil || e.shuttingDown {
+		return
+	}
+
+	err := e.webview.PostWebMessageAsString(message)
+	if err == nil || errors.Is(err, windows.ERROR_IO_PENDING) {
+		return
+	}
+	if isTransientWebView2State(err) && e.scheduleRetry(attempt, func() {
+		e.postMessageAttempt(message, attempt+1)
+	}) {
+		return
+	}
+	log.Printf("[WebView2] PostWebMessageAsString failed: %v", err)
 }
 
 func (e *Chromium) SetPermission(kind CoreWebView2PermissionKind, state CoreWebView2PermissionState) {

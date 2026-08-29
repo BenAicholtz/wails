@@ -3,6 +3,8 @@
 package application
 
 import (
+	"time"
+
 	"github.com/wailsapp/wails/v3/internal/webview2/pkg/edge"
 )
 
@@ -62,4 +64,30 @@ func SetWebView2ProcessFailedRecoveryHook(hook func(kind WebView2ProcessFailedKi
 	edge.ProcessFailedRecoveryHook = func(kind edge.COREWEBVIEW2_PROCESS_FAILED_KIND) bool {
 		return hook(WebView2ProcessFailedKind(kind))
 	}
+}
+
+// init wires WebView2's transient-failure retries into the main-thread
+// dispatcher.
+//
+// ExecuteScript and PostWebMessageAsString must run on the thread that owns the
+// WebView2 controller, which is the main thread (execJS dispatches onto it, and
+// PostWebMessageAsString runs inside a COM event callback). A retry therefore
+// cannot sleep in place without blocking the message pump. time.AfterFunc waits
+// on its own goroutine and dispatchOnMainThread hands the attempt back to the
+// right thread, so the UI keeps running while WebView2 recovers.
+//
+// Retried calls can land after calls issued later, since only the failing one
+// is delayed. That is deliberate: reordering a fire-and-forget script during a
+// GPU reset is a far smaller problem than freezing the UI for seconds, which is
+// long enough to trip an application freeze watchdog.
+func init() {
+	edge.SetRetryScheduler(func(delay time.Duration, fn func()) {
+		time.AfterFunc(delay, func() {
+			app := globalApplication
+			if app == nil {
+				return
+			}
+			app.dispatchOnMainThread(fn)
+		})
+	})
 }
