@@ -43,17 +43,22 @@ func init() {
 		_ = os.Setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
 	}
 
-	// Disable DMA-BUF renderer on AMD GPUs under Wayland to prevent rendering
-	// corruption: vertical/horizontal banding or striping across the whole
-	// window, most visible while resizing. Unlike the NVIDIA case this isn't a
-	// blank window, so it's easy to ship without noticing — some Mesa/radeonsi
-	// + Wayland compositor combinations still hit this with WebKitGTK's DMA-BUF
-	// (GBM) path as of Mesa releases current in September 2026, contrary to
-	// the assumption that this was only ever an old-Mesa problem.
-	// X11+AMD is not known to be affected by this specific corruption, so the
-	// hardware path stays on there.
-	if os.Getenv("WEBKIT_DISABLE_DMABUF_RENDERER") == "" && isWaylandSession() && isAMDGPU() {
-		_ = os.Setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+	// AMD GPUs under Wayland: work around DCC (Delta Color Compression)
+	// corruption instead of falling back to software rendering. WebKitGTK's
+	// DMA-BUF-backed surfaces cross a process boundary (web/GPU process -> UI
+	// process -> Wayland compositor); DCC needs an explicit decompress on any
+	// access that doesn't have its metadata, and that's the same corruption
+	// class every DMA-BUF-sharing AMD/Mesa app can hit — vertical/horizontal
+	// banding or striping across the whole window, worse right after a buffer
+	// reallocation like a window resize. AMD_DEBUG=nodcc (radeonsi/Gallium,
+	// what WebKitGTK's GBM/EGL compositing path uses) and RADV_DEBUG=nodcc
+	// (Vulkan/RADV, in case a WebGL/canvas context takes that path) disable
+	// DCC rather than disabling hardware acceleration outright — keeps AMD
+	// users on the fast path instead of paying the CPU-rendering cost that
+	// used to make this client feel laggy on every large server.
+	if isWaylandSession() && isAMDGPU() {
+		appendMesaDebugFlag("AMD_DEBUG", "nodcc")
+		appendMesaDebugFlag("RADV_DEBUG", "nodcc")
 	}
 }
 
@@ -62,23 +67,6 @@ func isNVIDIAGPU() bool {
 	// Check if nvidia module is loaded (most reliable for proprietary driver)
 	if _, err := os.Stat("/sys/module/nvidia"); err == nil {
 		return true
-	}
-	return false
-}
-
-// isAMDGPU checks if an AMD GPU (discrete or integrated) is present by reading
-// the DRM device vendor ID (0x1002 is AMD/ATI) rather than relying on a
-// specific kernel module name, so it catches amdgpu and the legacy radeon
-// driver alike.
-func isAMDGPU() bool {
-	entries, err := filepath.Glob("/sys/class/drm/card*/device/vendor")
-	if err != nil {
-		return false
-	}
-	for _, path := range entries {
-		if vendor, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(vendor)) == "0x1002" {
-			return true
-		}
 	}
 	return false
 }
