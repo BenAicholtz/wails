@@ -137,10 +137,23 @@ func enumScreensProc(hMonitor uintptr, hdc uintptr, lprcMonitor *RECT, lParam ui
 
 	// Get DPI for monitor
 	var dpiX, dpiY uint
-	ret = GetDPIForMonitor(hMonitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)
-	if ret != S_OK {
-		enumScreens.errMsg = "GetDpiForMonitor failed"
-		return 0 // Stop enumeration
+	if HasGetDPIForMonitorFunc() {
+		ret = GetDPIForMonitor(hMonitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)
+		if ret != S_OK {
+			enumScreens.errMsg = "GetDpiForMonitor failed"
+			return 0 // Stop enumeration
+		}
+	} else {
+		// GetDpiForMonitor is Windows 8.1+. On Windows 7/8.0 calling it
+		// panics (LazyProc.mustFind) inside processAndCacheScreens, which
+		// kills the app at startup. Fall back to the system DPI, the same
+		// fallback windowsWebviewWindow.DPI() uses.
+		hdc := GetDC(0)
+		dpiX = uint(GetDeviceCaps(hdc, LOGPIXELSX))
+		ReleaseDC(0, hdc)
+		if dpiX == 0 {
+			dpiX = 96
+		}
 	}
 	// Convert to scale factor
 	screen.ScaleFactor = float32(dpiX) / 96.0
