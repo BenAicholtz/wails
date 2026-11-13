@@ -559,6 +559,28 @@ func (e *Chromium) EnvironmentCompleted(res uintptr, env *ICoreWebView2Environme
 // and a retry against the already-created environment usually succeeds.
 const maxControllerRetries = 3
 
+// MemoryDiagnostics, when the host application sets it, returns a one-line
+// summary of memory pressure that is appended to controller-creation failures.
+//
+// Controller creation failing (0x80070578 ERROR_INVALID_WINDOW_HANDLE in
+// particular) is frequently the first visible symptom of a machine running out
+// of memory, and is often followed seconds later by Chromium's OOM exception
+// (0xE0000008) killing the process outright. That fatal path can't log
+// anything, so the numbers have to be captured here, on the last log line the
+// process is still alive to write. Set via
+// application.SetWebView2MemoryDiagnosticsHook.
+var MemoryDiagnostics func() string
+
+func memoryDiagnosticsSuffix() string {
+	if MemoryDiagnostics == nil {
+		return ""
+	}
+	if s := MemoryDiagnostics(); s != "" {
+		return " memory: " + s
+	}
+	return ""
+}
+
 func (e *Chromium) CreateCoreWebView2ControllerCompleted(res uintptr, controller *ICoreWebView2Controller) uintptr {
 	if e.shuttingDown || e.initErr != nil {
 		if controller != nil {
@@ -568,8 +590,8 @@ func (e *Chromium) CreateCoreWebView2ControllerCompleted(res uintptr, controller
 	}
 	if int32(res) < 0 || controller == nil {
 		e.controllerRetryCount++
-		log.Printf("[WebView2] Controller creation failed with %08x: %s (attempt %d/%d)",
-			res, syscall.Errno(res), e.controllerRetryCount, maxControllerRetries)
+		log.Printf("[WebView2] Controller creation failed with %08x: %s (attempt %d/%d)%s",
+			res, syscall.Errno(res), e.controllerRetryCount, maxControllerRetries, memoryDiagnosticsSuffix())
 		if e.controllerRetryCount < maxControllerRetries && e.environment != nil {
 			if err := e.environment.CreateCoreWebView2Controller(e.hwnd, e.controllerCompleted); err != nil {
 				e.errorCallback(fmt.Errorf("error retrying controller creation: %s", err.Error()))

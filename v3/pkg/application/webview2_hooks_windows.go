@@ -3,6 +3,7 @@
 package application
 
 import (
+	"log"
 	"time"
 
 	"github.com/wailsapp/wails/v3/internal/webview2/pkg/edge"
@@ -64,6 +65,49 @@ func SetWebView2ProcessFailedRecoveryHook(hook func(kind WebView2ProcessFailedKi
 	edge.ProcessFailedRecoveryHook = func(kind edge.COREWEBVIEW2_PROCESS_FAILED_KIND) bool {
 		return hook(WebView2ProcessFailedKind(kind))
 	}
+}
+
+// SetWebView2MemoryDiagnosticsHook installs a function whose one-line memory
+// summary is appended to the log line WebView2 writes when controller creation
+// fails, often the last line written before an out-of-memory kill. Pass nil to
+// remove it.
+func SetWebView2MemoryDiagnosticsHook(fn func() string) {
+	edge.MemoryDiagnostics = fn
+}
+
+// SetWebView2MemoryUsageTargetLow lowers (true) or restores (false) the
+// window's WebView2 memory target, through ICoreWebView2_19's
+// MemoryUsageTargetLevel. While LOW, WebView2 trims caches and releases what
+// it can, which suits a window that is hidden or minimized; script, timers,
+// audio and WebRTC keep running. Restore NORMAL when the window is shown
+// again.
+//
+// Asynchronous and best-effort: it is dispatched to the UI thread, and on a
+// runtime older than the interface (114 and earlier), or a window not yet
+// created or already destroyed, it does nothing.
+func (w *WebviewWindow) SetWebView2MemoryUsageTargetLow(low bool) {
+	if w == nil || w.impl == nil || w.isDestroyed() {
+		return
+	}
+	InvokeAsync(func() {
+		if w.isDestroyed() {
+			return
+		}
+		impl, ok := w.impl.(*windowsWebviewWindow)
+		if !ok || impl == nil || impl.chromium == nil {
+			return
+		}
+		level := edge.COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL
+		if low {
+			level = edge.COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW
+		}
+		// Logged, not routed through App.error: that reaches the
+		// application's ErrorHandler, which may treat WebView2 errors as
+		// fatal, and a failed memory hint never is.
+		if err := impl.chromium.SetMemoryUsageTargetLevel(level); err != nil && err != edge.UnsupportedCapabilityError {
+			log.Printf("[WebView2] MemoryUsageTargetLevel(low=%v) failed for window %d: %v", low, w.id, err)
+		}
+	})
 }
 
 // init wires WebView2's transient-failure retries into the main-thread
